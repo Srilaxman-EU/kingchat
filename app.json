@@ -3,7 +3,27 @@
     "name": "King Chat",
     "slug": "king-chat",
     "version": "1.0.0",
-    "platforms": ["ios", "android", "web"],
-    "web": { "bundler": "metro" }
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "ios": { "supportsTablet": true },
+    "android": {
+      "package": "com.yourname.kingchat",
+      "versionCode": 1,
+      "permissions": [
+        "CAMERA",
+        "RECORD_AUDIO",
+        "MODIFY_AUDIO_SETTINGS",
+        "VIDEO_CAPTURE",
+        "AUDIO_CAPTURE"
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      }
+    },
+    "web": {
+      "bundler": "metro"
+    }
   }
 }

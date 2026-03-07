@@ -7,6 +7,7 @@ import { supabase } from './supabase';
 
 const Stack = createStackNavigator();
 
+// --- WELCOME PAGE ---
 function Welcome({ navigation }) {
   return (
     <View style={styles.c}>
@@ -18,6 +19,7 @@ function Welcome({ navigation }) {
   );
 }
 
+// --- LOGIN PAGE ---
 function Login({ navigation }) {
   const [u, setU] = useState(''); const [p, setP] = useState(''); const [isR, setR] = useState(false);
   const auth = async () => {
@@ -40,9 +42,14 @@ function Login({ navigation }) {
   );
 }
 
+// --- CHAT PAGE WITH VIDEO CALL ---
 function Chat({ route }) {
-  const { me } = route.params; const [users, setUsers] = useState([]); const [sel, setSel] = useState(null);
-  const [msgs, setMsgs] = useState([]); const [txt, setTxt] = useState('');
+  const { me } = route.params; 
+  const [users, setUsers] = useState([]); 
+  const [sel, setSel] = useState(null);
+  const [msgs, setMsgs] = useState([]); 
+  const [txt, setTxt] = useState('');
+  const [showVideo, setShowVideo] = useState(false);
 
   useEffect(() => {
     supabase.from('users_table').select('username').then(({data}) => setUsers(data.filter(x => x.username !== me)));
@@ -57,29 +64,61 @@ function Chat({ route }) {
     return () => supabase.removeChannel(sub);
   }, [sel]);
 
+  const startCall = () => {
+    if (!sel) return;
+    setShowVideo(true);
+  };
+
+  // Unique Room ID for the two users
+  const roomId = [me, sel].sort().join('-');
+
   return (
     <View style={styles.row}>
+      {/* SIDEBAR */}
       <View style={styles.sidebar}>
         <Text style={styles.sideH}>King Chat</Text>
         <FlatList data={users} renderItem={({item}) => (
-          <TouchableOpacity style={[styles.tab, sel === item.username && styles.act]} onPress={() => setSel(item.username)}>
+          <TouchableOpacity style={[styles.tab, sel === item.username && styles.act]} onPress={() => {setSel(item.username); setShowVideo(false);}}>
             <Text style={sel === item.username && {color:'#fff'}}>{item.username}</Text>
           </TouchableOpacity>
         )} />
       </View>
+
+      {/* CHAT AREA */}
       <View style={styles.main}>
         {sel ? (
           <View style={{flex:1}}>
-            <View style={styles.head}><Text>Chat with {sel}</Text></View>
-            <FlatList data={msgs} renderItem={({item}) => (
-              <View style={[styles.msg, item.sender_username === me ? styles.my : styles.ot]}>
-                <Text>{item.content}</Text>
-              </View>
-            )} />
-            <View style={styles.in}>
-              <TextInput value={txt} onChangeText={setTxt} style={styles.f} placeholder="Type..." />
-              <TouchableOpacity onPress={async () => { await supabase.from('messages').insert([{ sender_username: me, receiver_username: sel, content: txt }]); setTxt(''); }} style={styles.sB}><Text style={{color:'#fff'}}>Send</Text></TouchableOpacity>
+            <View style={styles.head}>
+              <Text style={{fontWeight:'bold'}}>Chat with {sel}</Text>
+              <TouchableOpacity onPress={startCall} style={styles.callBtn}>
+                <Text style={{color:'#fff', fontSize:12}}>Video Call</Text>
+              </TouchableOpacity>
             </View>
+
+            {showVideo ? (
+              <View style={styles.videoContainer}>
+                <TouchableOpacity onPress={() => setShowVideo(false)} style={styles.closeVideo}>
+                  <Text style={{color:'#fff'}}>End Call</Text>
+                </TouchableOpacity>
+                <iframe
+                  src={`https://meet.jit.si/${roomId}#config.prejoinPageEnabled=false`}
+                  style={{ flex: 1, width: '100%', height: '100%', border: 'none' }}
+                  allow="camera; microphone; display-capture; fullscreen"
+                />
+              </View>
+            ) : (
+              <>
+                <FlatList data={msgs} renderItem={({item}) => (
+                  <View style={[styles.msg, item.sender_username === me ? styles.my : styles.ot]}>
+                    <Text>{item.content}</Text>
+                  </View>
+                )} />
+                <View style={styles.in}>
+                  <TextInput value={txt} onChangeText={setTxt} style={styles.f} placeholder="Type..." />
+                  <TouchableOpacity onPress={async () => { await supabase.from('messages').insert([{ sender_username: me, receiver_username: sel, content: txt }]); setTxt(''); }} style={styles.sB}><Text style={{color:'#fff'}}>Send</Text></TouchableOpacity>
+                </View>
+              </>
+            )}
           </View>
         ) : <View style={styles.c}><Text>Select a contact</Text></View>}
       </View>
@@ -106,7 +145,10 @@ const styles = StyleSheet.create({
   sideH: { padding: 20, fontSize: 20, fontWeight: 'bold', color: '#0088cc' },
   tab: { padding: 15, borderBottomWidth: 1, borderColor: '#ddd' },
   act: { backgroundColor: '#0088cc' },
-  head: { padding: 15, borderBottomWidth: 1, borderColor: '#eee' },
+  head: { padding: 15, borderBottomWidth: 1, borderColor: '#eee', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  callBtn: { backgroundColor: '#28a745', padding: 8, borderRadius: 5 },
+  videoContainer: { flex: 1, backgroundColor: '#000' },
+  closeVideo: { backgroundColor: 'red', padding: 10, alignItems: 'center' },
   msg: { padding: 10, margin: 5, borderRadius: 10, maxWidth: '80%' },
   my: { alignSelf: 'flex-end', backgroundColor: '#dcf8c6' },
   ot: { alignSelf: 'flex-start', backgroundColor: '#eee' },

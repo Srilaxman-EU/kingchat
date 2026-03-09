@@ -1,12 +1,18 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, Alert, Platform, Modal } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, Alert, Platform } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
-import { RTCPeerConnection, RTCView, mediaDevices, RTCSessionDescription, RTCIceCandidate } from 'react-native-webrtc';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { supabase } from './supabase';
 
+// Safe Import for WebRTC
+let WebRTC = {};
+if (Platform.OS !== 'web') {
+  WebRTC = require('react-native-webrtc');
+}
+
 const Stack = createStackNavigator();
-const configuration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+const iceConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
 // --- SCREENS ---
 
@@ -33,7 +39,7 @@ function Login({ navigation }) {
     <TextInput placeholder="Username" style={styles.input} onChangeText={setU} autoCapitalize="none" />
     <TextInput placeholder="Password" style={styles.input} onChangeText={setP} secureTextEntry />
     <TouchableOpacity style={styles.btn} onPress={auth}><Text style={styles.btnTxt}>Submit</Text></TouchableOpacity>
-    <TouchableOpacity onPress={() => setR(!isR)}><Text style={styles.link}>{isR ? "Back to Login" : "Create Account"}</Text></TouchableOpacity></View>
+    <TouchableOpacity onPress={() => setR(!isR)}><Text style={styles.link}>{isR ? "Create Account" : "Go to Login"}</Text></TouchableOpacity></View>
   );
 }
 
@@ -44,30 +50,21 @@ function Chat({ route }) {
   const [msgs, setMsgs] = useState([]);
   const [txt, setTxt] = useState('');
   
-  // Calling States
-  const [incomingCall, setIncomingCall] = useState(null);
+  const [incoming, setIncoming] = useState(null);
   const [isCalling, setIsCalling] = useState(false);
   const [localStream, setLocalStream] = useState(null);
   const [remoteStream, setRemoteStream] = useState(null);
-  
   const pc = useRef(null);
 
   useEffect(() => {
     fetchUsers();
-    
-    // Global Listeners for Messages & Calls (Notifications)
-    const channel = supabase.channel('global')
+    const channel = supabase.channel('realtime')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, p => {
-        if (p.new.receiver_username === me) {
-          alert(`New message from ${p.new.sender_username}`);
-          if (sel === p.new.sender_username) setMsgs(curr => [...curr, p.new]);
-        }
+        if (p.new.receiver_username === me && sel === p.new.sender_username) setMsgs(c => [...c, p.new]);
       })
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'calls' }, p => {
-        if (p.new.receiver === me) handleSignaling(p.new);
-      })
-      .subscribe();
-
+        if (p.new.receiver === me) handleSignal(p.new);
+      }).subscribe();
     return () => supabase.removeChannel(channel);
   }, [sel]);
 
@@ -76,103 +73,51 @@ function Chat({ route }) {
     setUsers(data.filter(x => x.username !== me));
   };
 
-  // --- WEBRTC LOGIC ---
-
-  const stopCamera = () => {
-    if (localStream) {
-      localStream.getTracks().forEach(track => track.stop());
-      setLocalStream(null);
-    }
-    setRemoteStream(null);
+  // --- VIDEO LOGIC ---
+  const stopCall = () => {
+    if (localStream) localStream.getTracks().forEach(t => t.stop());
+    setLocalStream(null); setRemoteStream(null); setIsCalling(false);
     if (pc.current) pc.current.close();
-    setIsCalling(false);
   };
 
-  const startLocalStream = async () => {
-    const stream = await mediaDevices.getUserMedia({ video: true, audio: true });
-    setLocalStream(stream);
-    return stream;
-  };
-
-  const handleSignaling = async (signal) => {
-    if (signal.type === 'offer') setIncomingCall(signal);
-    if (signal.type === 'answer' && pc.current) {
-      await pc.current.setRemoteDescription(new RTCSessionDescription(signal.data));
+  const handleSignal = async (s) => {
+    if (s.type === 'offer') setIncoming(s);
+    if (s.type === 'hangup') stopCall();
+    if (s.type === 'answer' && pc.current) {
+        const desc = Platform.OS === 'web' ? s.data : new WebRTC.RTCSessionDescription(s.data);
+        await pc.current.setRemoteDescription(desc);
     }
-    if (signal.type === 'candidate' && pc.current) {
-      await pc.current.addIceCandidate(new RTCIceCandidate(signal.data));
-    }
-    if (signal.type === 'hangup') stopCamera();
   };
 
-  const initiateCall = async () => {
+  const startCall = async () => {
     setIsCalling(true);
-    const stream = await startLocalStream();
-    pc.current = new RTCPeerConnection(configuration);
-    stream.getTracks().forEach(t => pc.current.addTrack(t, stream));
-
-    pc.current.onicecandidate = (e) => {
-      if (e.candidate) sendSignal('candidate', e.candidate);
-    };
-    pc.current.ontrack = (e) => setRemoteStream(e.streams[0]);
+    const stream = await (Platform.OS === 'web' ? navigator.mediaDevices.getUserMedia({video:true, audio:true}) : WebRTC.mediaDevices.getUserMedia({video:true, audio:true}));
+    setLocalStream(stream);
+    
+    // Create PeerConnection
+    pc.current = Platform.OS === 'web' ? new RTCPeerConnection(iceConfig) : new WebRTC.RTCPeerConnection(iceConfig);
+    
+    if (Platform.OS === 'web') {
+        stream.getTracks().forEach(track => pc.current.addTrack(track, stream));
+        pc.current.ontrack = (e) => setRemoteStream(e.streams[0]);
+    } else {
+        pc.current.addStream(stream);
+        pc.current.onaddstream = (e) => setRemoteStream(e.stream);
+    }
 
     const offer = await pc.current.createOffer();
     await pc.current.setLocalDescription(offer);
-    sendSignal('offer', offer);
-  };
-
-  const answerCall = async () => {
-    const signal = incomingCall;
-    setIncomingCall(null);
-    setIsCalling(true);
-    setSel(signal.caller);
-
-    const stream = await startLocalStream();
-    pc.current = new RTCPeerConnection(configuration);
-    stream.getTracks().forEach(t => pc.current.addTrack(t, stream));
-
-    pc.current.onicecandidate = (e) => {
-      if (e.candidate) sendSignal('candidate', e.candidate, signal.caller);
-    };
-    pc.current.ontrack = (e) => setRemoteStream(e.streams[0]);
-
-    await pc.current.setRemoteDescription(new RTCSessionDescription(signal.data));
-    const answer = await pc.current.createAnswer();
-    await pc.current.setLocalDescription(answer);
-    
-    // Send answer back to caller
-    await supabase.from('calls').insert([{ caller: me, receiver: signal.caller, type: 'answer', data: answer }]);
-  };
-
-  const sendSignal = async (type, data, customReceiver = null) => {
-    await supabase.from('calls').insert([{
-      caller: me,
-      receiver: customReceiver || sel,
-      type: type,
-      data: data
-    }]);
-  };
-
-  const declineCall = async () => {
-    await supabase.from('calls').insert([{ caller: me, receiver: incomingCall.caller, type: 'hangup' }]);
-    setIncomingCall(null);
+    await supabase.from('calls').insert([{ caller: me, receiver: sel, type: 'offer', data: offer }]);
   };
 
   return (
     <View style={styles.row}>
-      {/* Incoming Call Overlay */}
-      {incomingCall && (
-        <View style={styles.notifBar}>
-          <Text style={{color:'#fff'}}>Incoming Call: {incomingCall.caller}</Text>
-          <View style={{flexDirection:'row'}}>
-            <TouchableOpacity onPress={answerCall} style={styles.accBtn}><Text style={{color:'#fff'}}>Accept</Text></TouchableOpacity>
-            <TouchableOpacity onPress={declineCall} style={styles.decBtn}><Text style={{color:'#fff'}}>Decline</Text></TouchableOpacity>
-          </View>
-        </View>
+      {incoming && (
+        <View style={styles.pop}><Text style={{color:'#fff'}}>Call from {incoming.caller}</Text>
+        <TouchableOpacity onPress={() => { setSel(incoming.caller); setIncoming(null); startCall(); }} style={styles.acc}><Text style={{color:'#fff'}}>Accept</Text></TouchableOpacity></View>
       )}
 
-      {/* SIDEBAR */}
-      <View style={styles.sidebar}>
+      <View style={styles.side}>
         <Text style={styles.sideH}>King Chat</Text>
         <FlatList data={users} renderItem={({item}) => (
           <TouchableOpacity style={[styles.tab, sel === item.username && styles.act]} onPress={() => setSel(item.username)}>
@@ -181,58 +126,48 @@ function Chat({ route }) {
         )} />
       </View>
 
-      {/* MAIN CHAT AREA */}
       <View style={styles.main}>
         {sel ? (
           <View style={{flex:1}}>
-            <View style={styles.head}>
-              <Text style={{fontWeight:'bold'}}>{sel}</Text>
-              {!isCalling && <TouchableOpacity onPress={initiateCall} style={styles.vBtn}><Text style={{color:'#fff'}}>Video Call</Text></TouchableOpacity>}
-            </View>
-
+            <View style={styles.head}><Text>{sel}</Text>
+            <TouchableOpacity onPress={startCall} style={styles.vBtn}><Text style={{color:'#fff'}}>Video Call</Text></TouchableOpacity></View>
+            
             {isCalling ? (
               <View style={styles.vBox}>
-                {remoteStream && <RTCView streamURL={remoteStream.toURL()} style={styles.remoteVideo} objectFit="cover" />}
-                {localStream && <RTCView streamURL={localStream.toURL()} style={styles.localVideo} objectFit="cover" zOrder={1} />}
-                <TouchableOpacity onPress={() => { sendSignal('hangup', null); stopCamera(); }} style={styles.endBtn}>
-                  <Text style={{color:'#fff'}}>End Call</Text>
-                </TouchableOpacity>
+                <TouchableOpacity onPress={() => { supabase.from('calls').insert([{caller:me, receiver:sel, type:'hangup'}]); stopCall(); }} style={styles.end}><Text style={{color:'#fff'}}>End</Text></TouchableOpacity>
+                <Text style={{color:'#fff', position:'absolute', top:20, alignSelf:'center'}}>Video Active</Text>
               </View>
             ) : (
               <View style={{flex:1}}>
-                <FlatList data={msgs} renderItem={({item}) => (
-                  <View style={[styles.msg, item.sender_username === me ? styles.my : styles.ot]}>
-                    <Text>{item.content}</Text>
-                  </View>
-                )} />
+                <FlatList data={msgs} renderItem={({item}) => <View style={styles.msg}><Text>{item.content}</Text></View>} />
                 <View style={styles.inRow}>
-                  <TextInput value={txt} onChangeText={setTxt} style={styles.fld} placeholder="Type..." />
-                  <TouchableOpacity onPress={async () => {
-                    await supabase.from('messages').insert([{ sender_username: me, receiver_username: sel, content: txt }]);
-                    setTxt('');
-                  }} style={styles.sBtn}><Text style={{color:'#fff'}}>Send</Text></TouchableOpacity>
+                  <TextInput value={txt} onChangeText={setTxt} style={styles.fld} placeholder="Message..." />
+                  <TouchableOpacity onPress={async () => { await supabase.from('messages').insert([{sender_username:me, receiver_username:sel, content:txt}]); setTxt(''); }} style={styles.sBtn}><Text style={{color:'#fff'}}>Send</Text></TouchableOpacity>
                 </View>
               </View>
             )}
           </View>
-        ) : <View style={styles.center}><Text>Select a contact</Text></View>}
+        ) : <View style={styles.center}><Text>Select Contact</Text></View>}
       </View>
     </View>
   );
 }
 
-// --- STYLES ---
+export default function App() {
+  return (
+    <GestureHandlerRootView style={{flex:1}}><NavigationContainer><Stack.Navigator screenOptions={{headerShown:false}}><Stack.Screen name="Welcome" component={Welcome} /><Stack.Screen name="Login" component={Login} /><Stack.Screen name="Chat" component={Chat} /></Stack.Navigator></NavigationContainer></GestureHandlerRootView>
+  );
+}
 
 const styles = StyleSheet.create({
   center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#fff' },
-  logo: { fontSize: 40, fontWeight: 'bold', color: '#0088cc', marginBottom: 20 },
+  logo: { fontSize: 40, fontWeight: 'bold', color: '#0088cc' },
   title: { fontSize: 24, marginBottom: 20 },
   input: { width: 250, borderBottomWidth: 1, padding: 10, marginBottom: 20 },
   btn: { backgroundColor: '#0088cc', padding: 15, borderRadius: 30, width: 200, alignItems: 'center' },
   btnTxt: { color: '#fff', fontWeight: 'bold' },
-  link: { marginTop: 20, color: '#0088cc' },
   row: { flex: 1, flexDirection: 'row' },
-  sidebar: { width: '30%', backgroundColor: '#f5f5f5', borderRightWidth: 1, borderColor: '#ccc', paddingTop: 50 },
+  side: { width: '30%', backgroundColor: '#f5f5f5', borderRightWidth: 1, borderColor: '#ccc', paddingTop: 50 },
   main: { width: '70%', flex: 1, paddingTop: 50 },
   sideH: { padding: 20, fontSize: 18, fontWeight: 'bold' },
   tab: { padding: 15, borderBottomWidth: 1, borderColor: '#ddd' },
@@ -240,28 +175,12 @@ const styles = StyleSheet.create({
   head: { padding: 15, borderBottomWidth: 1, borderColor: '#eee', flexDirection: 'row', justifyContent: 'space-between' },
   vBtn: { backgroundColor: '#28a745', padding: 8, borderRadius: 20, paddingHorizontal: 15 },
   vBox: { flex: 1, backgroundColor: '#000' },
-  remoteVideo: { flex: 1 },
-  localVideo: { width: 120, height: 180, position: 'absolute', bottom: 100, right: 20, borderRadius: 10, backgroundColor: '#333' },
-  endBtn: { backgroundColor: 'red', padding: 15, borderRadius: 30, position: 'absolute', bottom: 30, alignSelf: 'center' },
-  msg: { padding: 10, margin: 5, borderRadius: 10, maxWidth: '80%' },
-  my: { alignSelf: 'flex-end', backgroundColor: '#dcf8c6' },
-  ot: { alignSelf: 'flex-start', backgroundColor: '#eee' },
+  end: { backgroundColor: 'red', padding: 15, borderRadius: 30, position: 'absolute', bottom: 30, alignSelf: 'center' },
+  msg: { padding: 10, margin: 5, borderRadius: 10, maxWidth: '80%', backgroundColor:'#eee' },
   inRow: { flexDirection: 'row', padding: 15, borderTopWidth: 1, borderColor: '#eee' },
   fld: { flex: 1, backgroundColor: '#f0f0f0', padding: 10, borderRadius: 20 },
   sBtn: { backgroundColor: '#0088cc', padding: 10, borderRadius: 20, marginLeft: 10 },
-  notifBar: { position: 'absolute', top: 0, left: 0, right: 0, backgroundColor: '#0088cc', padding: 20, zIndex: 10, flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  accBtn: { backgroundColor: 'green', padding: 10, borderRadius: 5, marginRight: 10 },
-  decBtn: { backgroundColor: 'red', padding: 10, borderRadius: 5 }
+  pop: { position: 'absolute', top: 0, left: 0, right: 0, backgroundColor: '#0088cc', padding: 20, zIndex: 10, flexDirection: 'row', justifyContent: 'space-between' },
+  acc: { backgroundColor: 'green', padding: 10, borderRadius: 5 },
+  link: { marginTop: 20, color: '#0088cc' }
 });
-
-export default function App() {
-  return (
-    <NavigationContainer>
-      <Stack.Navigator screenOptions={{headerShown:false}}>
-        <Stack.Screen name="Welcome" component={Welcome} />
-        <Stack.Screen name="Login" component={Login} />
-        <Stack.Screen name="Chat" component={Chat} />
-      </Stack.Navigator>
-    </NavigationContainer>
-  );
-}

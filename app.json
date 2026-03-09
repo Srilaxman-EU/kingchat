@@ -1,13 +1,12 @@
 {
   "expo": {
+    "name": "King Chat",
+    "slug": "king-chat",
+    "version": "1.0.0",
     "android": {
-      "permissions": [
-        "CAMERA",
-        "RECORD_AUDIO",
-        "MODIFY_AUDIO_SETTINGS",
-        "ACCESS_NETWORK_STATE",
-        "INTERNET"
-      ]
-    }
+      "package": "com.kingchat.app",
+      "permissions": ["CAMERA", "RECORD_AUDIO", "MODIFY_AUDIO_SETTINGS"]
+    },
+    "web": { "bundler": "metro" }
   }
 }

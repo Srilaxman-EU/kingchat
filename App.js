@@ -61,139 +61,144 @@ function Chat({ route }) {
   const [txt, setTxt] = useState('');
   
   // Call States
-  const [callStatus, setCallStatus] = useState('idle'); // idle, calling, ringing, connected
+  const [callStatus, setCallStatus] = useState('idle'); 
   const [incoming, setIncoming] = useState(null);
   const [localStream, setLocalStream] = useState(null);
   const [remoteStream, setRemoteStream] = useState(null);
   const pc = useRef(null);
 
+  // 1. LOAD USERS LIST ON LOGIN
   useEffect(() => {
-    supabase.from('users_table').select('username').then(({ data }) => setUsers(data.filter(x => x.username !== me)));
-    
-    const sub = supabase.channel('global')
+    supabase.from('users_table').select('username').then(({ data }) => {
+      setUsers(data.filter(x => x.username !== me));
+    });
+  }, []);
+
+  // 2. LOAD OLD CHAT HISTORY WHEN SELECTING A USER
+  useEffect(() => {
+    if (!sel) return;
+
+    // Clear current screen and load history from DB
+    const loadHistory = async () => {
+      const { data, error } = await supabase
+        .from('messages')
+        .select('*')
+        .or(`and(sender_username.eq.${me},receiver_username.eq.${sel}),and(sender_username.eq.${sel},receiver_username.eq.${me})`)
+        .order('created_at', { ascending: true });
+      
+      if (!error) setMsgs(data);
+    };
+
+    loadHistory();
+
+    // 3. LISTEN FOR NEW MESSAGES (REAL-TIME)
+    const sub = supabase.channel(`chat_${sel}`)
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, p => {
-        if (p.new.receiver_username === me) {
-          alert(`Message from ${p.new.sender_username}: ${p.new.content}`);
-          if (sel === p.new.sender_username) setMsgs(curr => [...curr, p.new]);
+        const newMessage = p.new;
+        // Only show message if it belongs to the CURRENTLY OPENED chat
+        if (
+          (newMessage.sender_username === me && newMessage.receiver_username === sel) ||
+          (newMessage.sender_username === sel && newMessage.receiver_username === me)
+        ) {
+          setMsgs(curr => [...curr, newMessage]);
         }
       })
+      .subscribe();
+
+    // Listener for Incoming Calls (Global)
+    const callSub = supabase.channel('calls_global')
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'calls' }, p => {
         if (p.new.receiver === me) handleSignaling(p.new);
       }).subscribe();
-    return () => supabase.removeChannel(sub);
-  }, [sel]);
 
-  const handleSignaling = async (s) => {
-    if (s.type === 'offer') setIncoming(s);
-    if (s.type === 'answer' && pc.current) {
-      setCallStatus('connected');
-      const desc = Platform.OS === 'web' ? s.data : new WebRTC.RTCSessionDescription(s.data);
-      await pc.current.setRemoteDescription(desc);
-    }
-    if (s.type === 'hangup') endCall();
-  };
+    return () => {
+      supabase.removeChannel(sub);
+      supabase.removeChannel(callSub);
+    };
+  }, [sel]); // <--- This ensures history loads every time 'sel' (selected user) changes
 
-  const startCall = async (isCaller, signal = null) => {
-    setCallStatus(isCaller ? 'calling' : 'connected');
-    setIncoming(null);
+  const sendMessage = async () => {
+    if (!txt.trim() || !sel) return;
     
-    const stream = await (Platform.OS === 'web' ? navigator.mediaDevices.getUserMedia({ video: true, audio: true }) : WebRTC.mediaDevices.getUserMedia({ video: true, audio: true }));
-    setLocalStream(stream);
+    const newMessage = { 
+      sender_username: me, 
+      receiver_username: sel, 
+      content: txt 
+    };
 
-    pc.current = Platform.OS === 'web' ? new RTCPeerConnection(iceConfig) : new WebRTC.RTCPeerConnection(iceConfig);
+    // Save to Supabase (History)
+    const { error } = await supabase.from('messages').insert([newMessage]);
     
-    if (Platform.OS === 'web') {
-      stream.getTracks().forEach(t => pc.current.addTrack(t, stream));
-      pc.current.ontrack = (e) => setRemoteStream(e.streams[0]);
-    } else {
-      pc.current.addStream(stream);
-      pc.current.onaddstream = (e) => setRemoteStream(e.stream);
-    }
-
-    if (isCaller) {
-      const offer = await pc.current.createOffer();
-      await pc.current.setLocalDescription(offer);
-      await supabase.from('calls').insert([{ caller: me, receiver: sel, type: 'offer', data: offer }]);
-    } else {
-      await pc.current.setRemoteDescription(Platform.OS === 'web' ? signal.data : new WebRTC.RTCSessionDescription(signal.data));
-      const answer = await pc.current.createAnswer();
-      await pc.current.setLocalDescription(answer);
-      await supabase.from('calls').insert([{ caller: me, receiver: signal.caller, type: 'answer', data: answer }]);
+    if (!error) {
+      setTxt(''); // Clear input
+      // Note: The Realtime listener above will automatically add the message to the list
     }
   };
 
-  const endCall = () => {
-    if (localStream) localStream.getTracks().forEach(t => t.stop());
-    setLocalStream(null); setRemoteStream(null); setCallStatus('idle');
-    if (pc.current) pc.current.close();
-  };
+  // ... (Keep the rest of the signaling and video functions the same) ...
 
   return (
     <View style={styles.row}>
-      {/* 1. INCOMING CALL NOTIFICATION (MODAL) */}
-      <Modal visible={!!incoming} transparent animationType="slide">
-        <View style={styles.modalBg}>
-          <View style={styles.callCard}>
-            <Text style={styles.callName}>{incoming?.caller}</Text>
-            <Text style={{marginBottom:20}}>is calling you...</Text>
-            <View style={{flexDirection:'row'}}>
-              <TouchableOpacity onPress={() => { setSel(incoming.caller); startCall(false, incoming); }} style={styles.accBtn}><Text style={{color:'#fff'}}>Accept</Text></TouchableOpacity>
-              <TouchableOpacity onPress={() => { supabase.from('calls').insert([{caller:me, receiver:incoming.caller, type:'hangup'}]); setIncoming(null); }} style={styles.decBtn}><Text style={{color:'#fff'}}>Decline</Text></TouchableOpacity>
-            </View>
-          </View>
-        </View>
-      </Modal>
+      {/* (Keep the Calling Modals here) */}
 
-      {/* 2. SIDEBAR */}
       <View style={styles.side}>
         <Text style={styles.sideH}>King Chat</Text>
-        <FlatList data={users} renderItem={({item}) => (
-          <TouchableOpacity style={[styles.tab, sel === item.username && styles.act]} onPress={() => { setSel(item.username); setMsgs([]); }}>
-            <Text style={sel === item.username && {color:'#fff'}}>{item.username}</Text>
-          </TouchableOpacity>
-        )} />
+        <FlatList 
+          data={users} 
+          keyExtractor={(item) => item.username}
+          renderItem={({item}) => (
+            <TouchableOpacity 
+              style={[styles.tab, sel === item.username && styles.act]} 
+              onPress={() => setSel(item.username)}
+            >
+              <Text style={sel === item.username && {color:'#fff'}}>{item.username}</Text>
+            </TouchableOpacity>
+          )} 
+        />
       </View>
 
-      {/* 3. MAIN AREA */}
       <View style={styles.main}>
         {sel ? (
           <View style={{flex:1}}>
             <View style={styles.head}>
               <Text style={{fontWeight:'bold'}}>{sel}</Text>
-              <TouchableOpacity onPress={() => startCall(true)} style={styles.vBtn}><Text style={{color:'#fff'}}>Video Call</Text></TouchableOpacity>
+              <TouchableOpacity onPress={() => startCall(true)} style={styles.vBtn}>
+                <Text style={{color:'#fff'}}>Video Call</Text>
+              </TouchableOpacity>
             </View>
 
             {callStatus !== 'idle' ? (
               <View style={styles.videoWindow}>
-                {callStatus === 'calling' && !remoteStream && (
-                   <View style={styles.overlay}><Text style={styles.statusTxt}>Calling {sel}...</Text></View>
-                )}
-                
-                {/* BIG REMOTE VIDEO */}
-                <VideoStream stream={remoteStream} isLocal={false} />
-                
-                {/* SMALL LOCAL VIDEO (Bottom Right) */}
-                <View style={styles.smallBox}>
-                   <VideoStream stream={localStream} isLocal={true} />
-                </View>
-
-                <TouchableOpacity onPress={() => { supabase.from('calls').insert([{caller:me, receiver:sel, type:'hangup'}]); endCall(); }} style={styles.endBtn}>
-                  <Text style={{color:'#fff', fontWeight:'bold'}}>Hang up</Text>
-                </TouchableOpacity>
+                {/* ... (Keep VideoStream components here) ... */}
               </View>
             ) : (
               <View style={{flex:1}}>
-                <FlatList data={msgs} keyExtractor={(_,i)=>i.toString()} renderItem={({item}) => (
-                  <View style={[styles.msg, item.sender_username === me ? styles.my : styles.ot]}><Text>{item.content}</Text></View>
-                )} />
+                <FlatList 
+                  data={msgs} 
+                  keyExtractor={(item, index) => item.id ? item.id.toString() : index.toString()} 
+                  renderItem={({item}) => (
+                    <View style={[styles.msg, item.sender_username === me ? styles.my : styles.ot]}>
+                      <Text>{item.content}</Text>
+                    </View>
+                  )} 
+                />
                 <View style={styles.inRow}>
-                  <TextInput value={txt} onChangeText={setTxt} style={styles.fld} placeholder="Message..." />
-                  <TouchableOpacity onPress={async() => { await supabase.from('messages').insert([{sender_username:me, receiver_username:sel, content:txt}]); setMsgs(c=>[...c, {sender_username:me, content:txt}]); setTxt(''); }} style={styles.sBtn}><Text style={{color:'#fff'}}>Send</Text></TouchableOpacity>
+                  <TextInput 
+                    value={txt} 
+                    onChangeText={setTxt} 
+                    style={styles.fld} 
+                    placeholder="Type a message..." 
+                  />
+                  <TouchableOpacity onPress={sendMessage} style={styles.sBtn}>
+                    <Text style={{color:'#fff'}}>Send</Text>
+                  </TouchableOpacity>
                 </View>
               </View>
             )}
           </View>
-        ) : <View style={styles.center}><Text>Select a contact</Text></View>}
+        ) : (
+          <View style={styles.center}><Text>Select a contact to view history</Text></View>
+        )}
       </View>
     </View>
   );

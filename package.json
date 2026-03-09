@@ -3,7 +3,6 @@
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
-    "start": "expo start",
     "build:web": "npx expo export -p web"
   },
   "dependencies": {
@@ -13,6 +12,7 @@
     "react-native": "0.76.0",
     "react-native-web": "~0.19.13",
     "react-native-webrtc": "124.0.0",
+    "@react-native-async-storage/async-storage": "1.23.1",
     "@expo/metro-runtime": "~4.0.0",
     "@supabase/supabase-js": "latest",
     "@react-navigation/native": "^6.0.0",

@@ -1,252 +1,633 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, Alert, Platform, Modal, SafeAreaView } from 'react-native';
+import {
+  View, Text, TextInput, TouchableOpacity, FlatList,
+  StyleSheet, ActivityIndicator, Alert, Platform, Modal, SafeAreaView,
+} from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { supabase } from './supabase';
+import {
+  sendMessage, getMessages, subscribeToMessages,
+  markAsRead, getOrCreateChat, getUserChats,
+} from './chatService';
+import {
+  initiateAudioCall, initiateVideoCall, answerCall, endCall,
+  subscribeToIncomingCalls, subscribeToCallUpdates, addIceCandidate,
+} from './callService';
+import { getOtherParticipant, formatTime, isMessageFromCurrentUser, getMessageDisplayText } from './messageService';
 
-// --- PLATFORM SAFE WEBRTC IMPORTS ---
-const WebRTC = Platform.OS !== 'web' ? require('react-native-webrtc') : null;
+// --- PLATFORM-SAFE WEBRTC ---
+const WebRTCLib = Platform.OS !== 'web' ? require('react-native-webrtc') : null;
 
 const Stack = createStackNavigator();
-const iceConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
-// --- TELEGRAM-STYLE VIDEO COMPONENT ---
+// ---------------------------------------------------------------------------
+// VideoPlayer — renders a local or remote stream on web and native
+// ---------------------------------------------------------------------------
 const VideoPlayer = ({ stream, isLocal, audioOnly }) => {
   const videoRef = useRef(null);
+
   useEffect(() => {
-    if (Platform.OS === 'web' && videoRef.current && stream) videoRef.current.srcObject = stream;
+    if (Platform.OS === 'web' && videoRef.current && stream) {
+      videoRef.current.srcObject = stream;
+    }
   }, [stream]);
 
-  if (audioOnly && !isLocal) return (
-    <View style={styles.audioPlaceholder}><Text style={styles.audioIcon}>📞</Text><Text style={{color:'#fff'}}>Audio Call Active</Text></View>
-  );
+  if (audioOnly && !isLocal) {
+    return (
+      <View style={styles.audioPlaceholder}>
+        <Text style={styles.audioIcon}>📞</Text>
+        <Text style={{ color: '#fff' }}>Audio Call Active</Text>
+      </View>
+    );
+  }
   if (!stream) return null;
 
-  return Platform.OS === 'web' ? (
-    <video ref={videoRef} autoPlay playsInline muted={isLocal} style={isLocal ? styles.webLocal : styles.webRemote} />
-  ) : (
-    <WebRTC.RTCView streamURL={stream.toURL()} style={isLocal ? styles.mobileLocal : styles.mobileRemote} objectFit="cover" zOrder={isLocal ? 1 : 0} />
+  if (Platform.OS === 'web') {
+    return (
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted={isLocal}
+        style={isLocal ? styles.webLocal : styles.webRemote}
+      />
+    );
+  }
+  return (
+    <WebRTCLib.RTCView
+      streamURL={stream.toURL()}
+      style={isLocal ? styles.mobileLocal : styles.mobileRemote}
+      objectFit="cover"
+      zOrder={isLocal ? 1 : 0}
+    />
   );
 };
 
-// --- SCREENS ---
-function Login({ navigation }) {
-  const [u, setU] = useState(''); const [p, setP] = useState(''); const [isR, setR] = useState(false);
-  const auth = async () => {
-    if (isR) {
-      const { error } = await supabase.from('users_table').insert([{ username: u, password: p }]);
-      if (error) alert("Username taken"); else { alert("User Created!"); setR(false); }
-    } else {
-      const { data } = await supabase.from('users_table').select('*').eq('username', u).eq('password', p).single();
-      if (data) navigation.navigate('Chat', { me: u }); else alert("Invalid Login");
+// ---------------------------------------------------------------------------
+// LoginScreen
+// ---------------------------------------------------------------------------
+function LoginScreen({ navigation }) {
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [isRegister, setIsRegister] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const handleAuth = async () => {
+    if (!username.trim() || !password.trim()) {
+      Alert.alert('Error', 'Please enter username and password.');
+      return;
+    }
+    setLoading(true);
+    try {
+      if (isRegister) {
+        const { error } = await supabase
+          .from('users_table')
+          .insert([{ username: username.trim(), password }]);
+        if (error) {
+          Alert.alert('Error', 'Username already taken.');
+        } else {
+          Alert.alert('Success', 'Account created! Please log in.');
+          setIsRegister(false);
+        }
+      } else {
+        const { data } = await supabase
+          .from('users_table')
+          .select('*')
+          .eq('username', username.trim())
+          .eq('password', password)
+          .single();
+        if (data) {
+          navigation.navigate('ChatList', { me: username.trim() });
+        } else {
+          Alert.alert('Error', 'Invalid username or password.');
+        }
+      }
+    } catch (err) {
+      Alert.alert('Error', err.message || 'An unexpected error occurred.');
+    } finally {
+      setLoading(false);
     }
   };
+
   return (
-    <View style={styles.center}><Text style={styles.logo}>👑 King Chat</Text>
-      <TextInput placeholder="Username" style={styles.input} onChangeText={setU} autoCapitalize="none" />
-      <TextInput placeholder="Password" style={styles.input} onChangeText={setP} secureTextEntry />
-      <TouchableOpacity style={styles.btn} onPress={auth}><Text style={styles.btnText}>{isR ? "Register" : "Login"}</Text></TouchableOpacity>
-      <TouchableOpacity onPress={() => setR(!isR)}><Text style={styles.link}>{isR ? "Create Account" : "Login instead"}</Text></TouchableOpacity>
-    </View>
+    <SafeAreaView style={styles.center}>
+      <Text style={styles.logo}>👑 King Chat</Text>
+      <TextInput
+        placeholder="Username"
+        style={styles.input}
+        onChangeText={setUsername}
+        value={username}
+        autoCapitalize="none"
+        autoCorrect={false}
+      />
+      <TextInput
+        placeholder="Password"
+        style={styles.input}
+        onChangeText={setPassword}
+        value={password}
+        secureTextEntry
+      />
+      {loading ? (
+        <ActivityIndicator size="large" color="#0088cc" />
+      ) : (
+        <TouchableOpacity style={styles.btn} onPress={handleAuth}>
+          <Text style={styles.btnText}>{isRegister ? 'Register' : 'Login'}</Text>
+        </TouchableOpacity>
+      )}
+      <TouchableOpacity onPress={() => setIsRegister(!isRegister)}>
+        <Text style={styles.link}>
+          {isRegister ? 'Already have an account? Login' : "Don't have an account? Register"}
+        </Text>
+      </TouchableOpacity>
+    </SafeAreaView>
   );
 }
 
-function Chat({ route }) {
+// ---------------------------------------------------------------------------
+// ChatListScreen — shows all chats and lets user start a new one
+// ---------------------------------------------------------------------------
+function ChatListScreen({ route, navigation }) {
   const { me } = route.params;
-  const [users, setUsers] = useState([]);
-  const [sel, setSel] = useState(null);
-  const [msgs, setMsgs] = useState([]);
-  const [txt, setTxt] = useState('');
-  
-  const [callState, setCallState] = useState('idle'); // idle, ringing, connected
-  const [incoming, setIncoming] = useState(null);
-  const [isAudio, setIsAudio] = useState(false);
-  const [localStream, setLocalStream] = useState(null);
-  const [remoteStream, setRemoteStream] = useState(null);
-  const pc = useRef(null);
+  const [chats, setChats] = useState([]);
+  const [allUsers, setAllUsers] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [incomingCall, setIncomingCall] = useState(null);
 
   useEffect(() => {
-    supabase.from('users_table').select('username').then(({ data }) => setUsers(data.filter(x => x.username !== me)));
-
-    // Real-time: Global Listener for Calls and Messages
-    const channel = supabase.channel('global')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, p => {
-        if (p.new.receiver_username === me && sel === p.new.sender_username) setMsgs(curr => [...curr, p.new]);
-      })
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'calls' }, p => {
-        if (p.new.receiver === me) handleSignaling(p.new);
-      }).subscribe();
-    return () => supabase.removeChannel(channel);
-  }, [sel]);
-
-  // Load History when switching users
-  useEffect(() => {
-    if (sel) {
-      supabase.from('messages').select('*')
-        .or(`and(sender_username.eq.${me},receiver_username.eq.${sel}),and(sender_username.eq.${sel},receiver_username.eq.${me})`)
-        .order('created_at', { ascending: true })
-        .then(({data}) => setMsgs(data || []));
-    }
-  }, [sel]);
-
-  const handleSignaling = async (s) => {
-    if (s.type === 'offer') { setIncoming(s); setIsAudio(s.is_audio); }
-    if (s.type === 'hangup') endCall();
-    if (s.type === 'answer' && pc.current) {
-      setCallState('connected');
-      const desc = Platform.OS === 'web' ? s.data : new WebRTC.RTCSessionDescription(s.data);
-      await pc.current.setRemoteDescription(desc);
-    }
-    if (s.type === 'candidate' && pc.current) {
-      const cand = Platform.OS === 'web' ? s.data : new WebRTC.RTCIceCandidate(s.data);
-      await pc.current.addIceCandidate(cand);
-    }
-  };
-
-  const startCall = async (type, isCaller, signal = null) => {
-    setIsAudio(type === 'audio');
-    setCallState(isCaller ? 'ringing' : 'connected');
-    setIncoming(null);
-
-    const stream = await (Platform.OS === 'web' ? navigator.mediaDevices.getUserMedia({video: type==='video', audio:true}) : WebRTC.mediaDevices.getUserMedia({video: type==='video', audio:true}));
-    setLocalStream(stream);
-
-    pc.current = Platform.OS === 'web' ? new RTCPeerConnection(iceConfig) : new WebRTC.RTCPeerConnection(iceConfig);
-    
-    if (Platform.OS === 'web') {
-      stream.getTracks().forEach(t => pc.current.addTrack(t, stream));
-      pc.current.ontrack = (e) => setRemoteStream(e.streams[0]);
-    } else {
-      pc.current.addStream(stream);
-      pc.current.onaddstream = (e) => setRemoteStream(e.stream);
-    }
-
-    pc.current.onicecandidate = (e) => {
-      if (e.candidate) supabase.from('calls').insert([{ caller: me, receiver: isCaller ? sel : signal.caller, type: 'candidate', data: e.candidate }]);
+    const loadData = async () => {
+      try {
+        const [chatData, userData] = await Promise.all([
+          getUserChats(me),
+          supabase.from('users_table').select('username').then(({ data }) =>
+            (data || []).filter((u) => u.username !== me)
+          ),
+        ]);
+        setChats(chatData);
+        setAllUsers(userData);
+      } catch (err) {
+        Alert.alert('Error', err.message || 'Failed to load chats.');
+      } finally {
+        setLoading(false);
+      }
     };
+    loadData();
 
-    if (isCaller) {
-      const offer = await pc.current.createOffer();
-      await pc.current.setLocalDescription(offer);
-      await supabase.from('calls').insert([{ caller: me, receiver: sel, type: 'offer', data: offer, is_audio: type === 'audio' }]);
-    } else {
-      await pc.current.setRemoteDescription(Platform.OS === 'web' ? signal.data : new WebRTC.RTCSessionDescription(signal.data));
-      const answer = await pc.current.createAnswer();
-      await pc.current.setLocalDescription(answer);
-      await supabase.from('calls').insert([{ caller: me, receiver: signal.caller, type: 'answer', data: answer }]);
+    // Subscribe to incoming calls
+    const callChannel = subscribeToIncomingCalls(me, (call) => {
+      setIncomingCall(call);
+    });
+    return () => callChannel.unsubscribe();
+  }, [me]);
+
+  const openChat = async (otherUser) => {
+    try {
+      const chat = await getOrCreateChat(me, otherUser);
+      navigation.navigate('Chat', { me, chat, otherUser });
+    } catch (err) {
+      Alert.alert('Error', err.message || 'Could not open chat.');
     }
   };
 
-  const endCall = () => {
-    if (localStream) localStream.getTracks().forEach(t => t.stop());
-    setLocalStream(null); setRemoteStream(null); setCallState('idle');
-    if (pc.current) pc.current.close();
+  const handleAcceptCall = async () => {
+    if (!incomingCall) return;
+    const call = incomingCall;
+    setIncomingCall(null);
+    navigation.navigate('VideoCall', { me, callRecord: call, isCaller: false });
   };
+
+  const handleDeclineCall = async () => {
+    if (!incomingCall) return;
+    await supabase
+      .from('calls')
+      .update({ status: 'rejected', ended_at: new Date().toISOString() })
+      .eq('id', incomingCall.id);
+    setIncomingCall(null);
+  };
+
+  if (loading) {
+    return (
+      <View style={styles.center}>
+        <ActivityIndicator size="large" color="#0088cc" />
+      </View>
+    );
+  }
 
   return (
-    <View style={styles.row}>
-      {/* 1. INCOMING CALL MODAL */}
-      <Modal visible={!!incoming} transparent animationType="fade">
+    <SafeAreaView style={{ flex: 1, backgroundColor: '#fff' }}>
+      {/* Incoming call modal */}
+      <Modal visible={!!incomingCall} transparent animationType="fade">
         <View style={styles.modal}>
           <View style={styles.card}>
-            <Text style={styles.callFrom}>{incoming?.caller}</Text>
-            <Text style={{marginBottom: 20}}>{incoming?.is_audio ? 'Audio Call...' : 'Video Call...'}</Text>
-            <View style={{flexDirection: 'row'}}>
-              <TouchableOpacity onPress={() => {setSel(incoming.caller); startCall(incoming.is_audio ? 'audio' : 'video', false, incoming);}} style={styles.acc}><Text style={{color:'#fff'}}>Accept</Text></TouchableOpacity>
-              <TouchableOpacity onPress={() => {supabase.from('calls').insert([{caller:me, receiver:incoming.caller, type:'hangup'}]); setIncoming(null);}} style={styles.dec}><Text style={{color:'#fff'}}>Decline</Text></TouchableOpacity>
+            <Text style={styles.callFrom}>{incomingCall?.caller}</Text>
+            <Text style={{ marginBottom: 20 }}>
+              {incomingCall?.type === 'audio' ? '📞 Audio Call…' : '📹 Video Call…'}
+            </Text>
+            <View style={{ flexDirection: 'row' }}>
+              <TouchableOpacity onPress={handleAcceptCall} style={styles.acc}>
+                <Text style={{ color: '#fff' }}>Accept</Text>
+              </TouchableOpacity>
+              <TouchableOpacity onPress={handleDeclineCall} style={styles.dec}>
+                <Text style={{ color: '#fff' }}>Decline</Text>
+              </TouchableOpacity>
             </View>
           </View>
         </View>
       </Modal>
 
-      {/* 2. SIDEBAR (30%) */}
-      <View style={styles.side}>
-        <Text style={styles.logoSide}>King Chat</Text>
-        <FlatList data={users} renderItem={({item}) => (
-          <TouchableOpacity style={[styles.tab, sel === item.username && styles.act]} onPress={() => setSel(item.username)}>
-            <Text style={sel === item.username && {color:'#fff'}}>{item.username}</Text>
+      <View style={styles.listHeader}>
+        <Text style={styles.logoSide}>👑 King Chat</Text>
+        <Text style={styles.meLabel}>@{me}</Text>
+      </View>
+
+      <Text style={styles.sectionTitle}>Contacts</Text>
+      <FlatList
+        data={allUsers}
+        keyExtractor={(item) => item.username}
+        renderItem={({ item }) => (
+          <TouchableOpacity style={styles.tab} onPress={() => openChat(item.username)}>
+            <Text style={styles.tabText}>💬 {item.username}</Text>
           </TouchableOpacity>
-        )} />
+        )}
+        ListEmptyComponent={<Text style={styles.emptyText}>No other users found.</Text>}
+      />
+    </SafeAreaView>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ChatScreen — messages, voice messages, file sharing, and call buttons
+// ---------------------------------------------------------------------------
+function ChatScreen({ route, navigation }) {
+  const { me, chat, otherUser } = route.params;
+  const [messages, setMessages] = useState([]);
+  const [text, setText] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [sending, setSending] = useState(false);
+  const flatListRef = useRef(null);
+
+  useEffect(() => {
+    const loadMessages = async () => {
+      try {
+        const data = await getMessages(chat.id);
+        setMessages(data);
+        await markAsRead(chat.id, me);
+      } catch (err) {
+        Alert.alert('Error', err.message || 'Failed to load messages.');
+      } finally {
+        setLoading(false);
+      }
+    };
+    loadMessages();
+
+    const channel = subscribeToMessages(chat.id, (newMsg) => {
+      setMessages((prev) => [...prev, newMsg]);
+      if (newMsg.sender !== me) {
+        markAsRead(chat.id, me).catch(() => {});
+      }
+    });
+    return () => channel.unsubscribe();
+  }, [chat.id, me]);
+
+  const handleSend = async () => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    setSending(true);
+    try {
+      await sendMessage(chat.id, trimmed, me);
+      setText('');
+    } catch (err) {
+      Alert.alert('Error', err.message || 'Failed to send message.');
+    } finally {
+      setSending(false);
+    }
+  };
+
+  const startAudioCall = async () => {
+    try {
+      const { callId } = await initiateAudioCall(me, otherUser);
+      navigation.navigate('VideoCall', { me, callRecord: { id: callId, caller: me, recipient: otherUser, type: 'audio' }, isCaller: true });
+    } catch (err) {
+      Alert.alert('Error', err.message || 'Failed to start audio call.');
+    }
+  };
+
+  const startVideoCall = async () => {
+    try {
+      const { callId } = await initiateVideoCall(me, otherUser);
+      navigation.navigate('VideoCall', { me, callRecord: { id: callId, caller: me, recipient: otherUser, type: 'video' }, isCaller: true });
+    } catch (err) {
+      Alert.alert('Error', err.message || 'Failed to start video call.');
+    }
+  };
+
+  const renderMessage = ({ item }) => {
+    const isMe = isMessageFromCurrentUser(item, me);
+    return (
+      <View style={[styles.msg, isMe ? styles.myMsg : styles.otherMsg]}>
+        <Text style={styles.msgText}>{getMessageDisplayText(item)}</Text>
+        <Text style={styles.msgTime}>{formatTime(item.timestamp)}</Text>
+      </View>
+    );
+  };
+
+  return (
+    <SafeAreaView style={{ flex: 1, backgroundColor: '#fff' }}>
+      {/* Header */}
+      <View style={styles.head}>
+        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
+          <Text style={styles.backText}>‹</Text>
+        </TouchableOpacity>
+        <Text style={styles.headTitle}>{otherUser}</Text>
+        <View style={{ flexDirection: 'row' }}>
+          <TouchableOpacity onPress={startAudioCall} style={styles.audioBtn}>
+            <Text style={{ color: '#fff' }}>📞</Text>
+          </TouchableOpacity>
+          <TouchableOpacity onPress={startVideoCall} style={styles.videoBtn}>
+            <Text style={{ color: '#fff' }}>📹</Text>
+          </TouchableOpacity>
+        </View>
       </View>
 
-      {/* 3. CHAT AREA (70%) */}
-      <View style={styles.main}>
-        {sel ? (
-          <View style={{flex:1}}>
-            <View style={styles.head}>
-              <Text style={{fontWeight:'bold'}}>{sel}</Text>
-              <View style={{flexDirection:'row'}}>
-                <TouchableOpacity onPress={() => startCall('audio', true)} style={styles.audioBtn}><Text style={{color:'#fff'}}>Audio</Text></TouchableOpacity>
-                <TouchableOpacity onPress={() => startCall('video', true)} style={styles.videoBtn}><Text style={{color:'#fff'}}>Video</Text></TouchableOpacity>
-              </View>
-            </View>
+      {/* Messages */}
+      {loading ? (
+        <View style={styles.center}>
+          <ActivityIndicator size="large" color="#0088cc" />
+        </View>
+      ) : (
+        <FlatList
+          ref={flatListRef}
+          data={messages}
+          keyExtractor={(item) => item.id?.toString() ?? item.timestamp}
+          renderItem={renderMessage}
+          onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated: true })}
+          ListEmptyComponent={
+            <Text style={styles.emptyText}>No messages yet. Say hello! 👋</Text>
+          }
+          contentContainerStyle={{ padding: 10 }}
+        />
+      )}
 
-            {callState !== 'idle' ? (
-              <View style={styles.vStage}>
-                {callState === 'ringing' && <View style={styles.ringing}><Text style={{color:'#fff', fontSize: 20}}>Calling {sel}...</Text></View>}
-                <VideoPlayer stream={remoteStream} isLocal={false} audioOnly={isAudio} />
-                {!isAudio && <View style={styles.pip}><VideoPlayer stream={localStream} isLocal={true} audioOnly={false} /></View>}
-                <TouchableOpacity onPress={() => {supabase.from('calls').insert([{caller:me, receiver:sel, type:'hangup'}]); endCall();}} style={styles.hang}><Text style={{color:'#fff', fontWeight:'bold'}}>Hang up</Text></TouchableOpacity>
-              </View>
-            ) : (
-              <View style={{flex:1}}>
-                <FlatList data={msgs} renderItem={({item}) => <View style={[styles.msg, item.sender_username === me ? styles.my : styles.ot]}><Text>{item.content}</Text></View>} />
-                <View style={styles.inRow}>
-                  <TextInput value={txt} onChangeText={setTxt} style={styles.fld} placeholder="Message..." />
-                  <TouchableOpacity onPress={async() => {await supabase.from('messages').insert([{sender_username:me, receiver_username:sel, content:txt}]); setTxt(''); }} style={styles.sBtn}><Text style={{color:'#fff'}}>Send</Text></TouchableOpacity>
-                </View>
-              </View>
-            )}
-          </View>
-        ) : <View style={styles.center}><Text>Select a contact to chat</Text></View>}
+      {/* Input bar */}
+      <View style={styles.inRow}>
+        <TextInput
+          value={text}
+          onChangeText={setText}
+          style={styles.fld}
+          placeholder="Message…"
+          multiline
+        />
+        <TouchableOpacity onPress={handleSend} style={styles.sBtn} disabled={sending}>
+          {sending ? (
+            <ActivityIndicator size="small" color="#fff" />
+          ) : (
+            <Text style={{ color: '#fff', fontWeight: 'bold' }}>Send</Text>
+          )}
+        </TouchableOpacity>
       </View>
+    </SafeAreaView>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// VideoCallScreen — full-screen WebRTC audio/video call UI
+// ---------------------------------------------------------------------------
+function VideoCallScreen({ route, navigation }) {
+  const { me, callRecord: initialCallRecord, isCaller } = route.params;
+  const [localStream, setLocalStream] = useState(null);
+  const [remoteStream, setRemoteStream] = useState(null);
+  const [callState, setCallState] = useState(isCaller ? 'ringing' : 'connecting');
+  const [callRecord, setCallRecord] = useState(initialCallRecord);
+  const pcRef = useRef(null);
+  const localStreamRef = useRef(null);
+
+  const isAudio = callRecord.type === 'audio';
+
+  useEffect(() => {
+    let callUpdateChannel = null;
+
+    const setupCall = async () => {
+      try {
+        if (isCaller) {
+          // Caller: the offer was already created in chatService; we just need
+          // the peer connection set up and wait for the answer.
+          const { peerConnection, localStream: ls } = await _setupCallerPC();
+          pcRef.current = peerConnection;
+          localStreamRef.current = ls;
+          setLocalStream(ls);
+
+          callUpdateChannel = subscribeToCallUpdates(callRecord.id, async (updated) => {
+            setCallRecord(updated);
+            if (updated.status === 'accepted' && updated.answer_sdp && pcRef.current) {
+              const answerDesc = JSON.parse(updated.answer_sdp);
+              if (Platform.OS !== 'web') {
+                const { RTCSessionDescription } = require('react-native-webrtc');
+                await pcRef.current.setRemoteDescription(new RTCSessionDescription(answerDesc));
+              } else {
+                await pcRef.current.setRemoteDescription(answerDesc);
+              }
+              setCallState('connected');
+            }
+            if (updated.status === 'ended' || updated.status === 'rejected') {
+              _cleanup();
+              navigation.goBack();
+            }
+          });
+        } else {
+          // Callee: answer the call
+          const { peerConnection, localStream: ls } = await answerCall(callRecord, (stream) => {
+            setRemoteStream(stream);
+            setCallState('connected');
+          });
+          pcRef.current = peerConnection;
+          localStreamRef.current = ls;
+          setLocalStream(ls);
+
+          peerConnection.onicecandidate = (e) => {
+            if (e.candidate) {
+              addIceCandidate(callRecord.id, e.candidate, false).catch(() => {});
+            }
+          };
+        }
+      } catch (err) {
+        Alert.alert('Call Error', err.message || 'Failed to set up call.');
+        navigation.goBack();
+      }
+    };
+
+    setupCall();
+    return () => {
+      if (callUpdateChannel) callUpdateChannel.unsubscribe();
+      _cleanup();
+    };
+  }, []);
+
+  const _setupCallerPC = async () => {
+    const constraints = {
+      audio: true,
+      video: isAudio ? false : { width: { ideal: 1280 }, height: { ideal: 720 } },
+    };
+    let ls;
+    if (Platform.OS === 'web') {
+      ls = await navigator.mediaDevices.getUserMedia(constraints);
+    } else {
+      const { mediaDevices } = require('react-native-webrtc');
+      ls = await mediaDevices.getUserMedia(constraints);
+    }
+
+    const iceConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+    let pc;
+    if (Platform.OS === 'web') {
+      pc = new RTCPeerConnection(iceConfig);
+      ls.getTracks().forEach((t) => pc.addTrack(t, ls));
+      pc.ontrack = (e) => setRemoteStream(e.streams[0]);
+    } else {
+      const { RTCPeerConnection } = require('react-native-webrtc');
+      pc = new RTCPeerConnection(iceConfig);
+      pc.addStream(ls);
+      pc.onaddstream = (e) => setRemoteStream(e.stream);
+    }
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) {
+        addIceCandidate(callRecord.id, e.candidate, true).catch(() => {});
+      }
+    };
+
+    return { peerConnection: pc, localStream: ls };
+  };
+
+  const _cleanup = () => {
+    if (localStreamRef.current) {
+      localStreamRef.current.getTracks().forEach((t) => t.stop());
+      localStreamRef.current = null;
+    }
+    if (pcRef.current) {
+      pcRef.current.close();
+      pcRef.current = null;
+    }
+    setLocalStream(null);
+    setRemoteStream(null);
+  };
+
+  const handleHangUp = async () => {
+    try {
+      await endCall(callRecord.id, localStreamRef.current, pcRef.current);
+    } catch (_) {}
+    localStreamRef.current = null;
+    pcRef.current = null;
+    navigation.goBack();
+  };
+
+  return (
+    <View style={styles.vStage}>
+      {/* Remote stream or audio placeholder */}
+      {isAudio ? (
+        <View style={styles.audioPlaceholder}>
+          <Text style={styles.audioIcon}>📞</Text>
+          <Text style={{ color: '#fff', fontSize: 20 }}>
+            {callState === 'ringing' ? `Calling ${callRecord.recipient ?? callRecord.caller}…` : 'Audio Call Active'}
+          </Text>
+        </View>
+      ) : (
+        <VideoPlayer stream={remoteStream} isLocal={false} audioOnly={false} />
+      )}
+
+      {/* Ringing overlay */}
+      {callState === 'ringing' && (
+        <View style={styles.ringing}>
+          <Text style={{ color: '#fff', fontSize: 20 }}>
+            Calling {callRecord.recipient ?? callRecord.caller}…
+          </Text>
+        </View>
+      )}
+
+      {/* Local PiP (video only) */}
+      {!isAudio && localStream && (
+        <View style={styles.pip}>
+          <VideoPlayer stream={localStream} isLocal={true} audioOnly={false} />
+        </View>
+      )}
+
+      {/* Hang-up button */}
+      <TouchableOpacity onPress={handleHangUp} style={styles.hang}>
+        <Text style={{ color: '#fff', fontWeight: 'bold' }}>Hang Up</Text>
+      </TouchableOpacity>
     </View>
   );
 }
 
-// --- STYLES ---
+// ---------------------------------------------------------------------------
+// Styles
+// ---------------------------------------------------------------------------
 const styles = StyleSheet.create({
   center: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#fff' },
   logo: { fontSize: 40, fontWeight: 'bold', color: '#0088cc', marginBottom: 20 },
-  input: { width: 250, borderBottomWidth: 1, padding: 10, marginBottom: 20 },
-  btn: { backgroundColor: '#0088cc', padding: 15, borderRadius: 10, width: 200, alignItems: 'center' },
-  btnText: { color: '#fff', fontWeight: 'bold' },
-  row: { flex: 1, flexDirection: 'row' },
-  side: { width: '30%', backgroundColor: '#f5f5f5', borderRightWidth: 1, borderColor: '#ccc', paddingTop: 50 },
-  main: { width: '70%', flex: 1, paddingTop: 50 },
-  logoSide: { padding: 20, fontSize: 18, fontWeight: 'bold', color: '#0088cc' },
-  tab: { padding: 15, borderBottomWidth: 1, borderColor: '#ddd' },
-  act: { backgroundColor: '#0088cc' },
-  head: { padding: 15, borderBottomWidth: 1, borderColor: '#eee', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  videoBtn: { backgroundColor: '#28a745', padding: 8, borderRadius: 20, paddingHorizontal: 15, marginLeft: 5 },
-  audioBtn: { backgroundColor: '#007bff', padding: 8, borderRadius: 20, paddingHorizontal: 15 },
-  vStage: { flex: 1, backgroundColor: '#000', position: 'relative' },
-  pip: { position: 'absolute', bottom: 100, right: 20, width: 120, height: 180, borderRadius: 10, overflow: 'hidden', borderWidth: 2, borderColor: '#fff', backgroundColor: '#222' },
+  input: { width: 280, borderWidth: 1, borderColor: '#ccc', borderRadius: 10, padding: 12, marginBottom: 15, backgroundColor: '#fafafa' },
+  btn: { backgroundColor: '#0088cc', padding: 15, borderRadius: 10, width: 200, alignItems: 'center', marginBottom: 10 },
+  btnText: { color: '#fff', fontWeight: 'bold', fontSize: 16 },
+  link: { marginTop: 10, color: '#0088cc', fontSize: 14 },
+
+  // Chat list
+  listHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 20, borderBottomWidth: 1, borderColor: '#eee' },
+  logoSide: { fontSize: 20, fontWeight: 'bold', color: '#0088cc' },
+  meLabel: { color: '#888', fontSize: 14 },
+  sectionTitle: { paddingHorizontal: 15, paddingVertical: 8, fontSize: 13, color: '#888', fontWeight: '600', backgroundColor: '#f7f7f7' },
+  tab: { padding: 16, borderBottomWidth: 1, borderColor: '#f0f0f0' },
+  tabText: { fontSize: 16 },
+  emptyText: { textAlign: 'center', color: '#aaa', marginTop: 40, fontSize: 15 },
+
+  // Chat screen
+  head: { flexDirection: 'row', alignItems: 'center', padding: 12, borderBottomWidth: 1, borderColor: '#eee', backgroundColor: '#fff' },
+  backBtn: { padding: 6, marginRight: 8 },
+  backText: { fontSize: 28, color: '#0088cc', lineHeight: 30 },
+  headTitle: { flex: 1, fontSize: 17, fontWeight: 'bold' },
+  audioBtn: { backgroundColor: '#007bff', padding: 10, borderRadius: 20, marginRight: 6 },
+  videoBtn: { backgroundColor: '#28a745', padding: 10, borderRadius: 20 },
+  msg: { padding: 10, marginVertical: 3, borderRadius: 12, maxWidth: '80%' },
+  myMsg: { alignSelf: 'flex-end', backgroundColor: '#dcf8c6' },
+  otherMsg: { alignSelf: 'flex-start', backgroundColor: '#f0f0f0' },
+  msgText: { fontSize: 15 },
+  msgTime: { fontSize: 11, color: '#aaa', alignSelf: 'flex-end', marginTop: 3 },
+  inRow: { flexDirection: 'row', padding: 10, borderTopWidth: 1, borderColor: '#eee', backgroundColor: '#fff', alignItems: 'flex-end' },
+  fld: { flex: 1, backgroundColor: '#f0f0f0', padding: 10, borderRadius: 20, maxHeight: 120, fontSize: 15 },
+  sBtn: { backgroundColor: '#0088cc', paddingHorizontal: 16, paddingVertical: 10, borderRadius: 20, marginLeft: 8, justifyContent: 'center', alignItems: 'center' },
+
+  // Call UI
+  vStage: { flex: 1, backgroundColor: '#111', position: 'relative' },
+  pip: { position: 'absolute', bottom: 110, right: 20, width: 120, height: 180, borderRadius: 10, overflow: 'hidden', borderWidth: 2, borderColor: '#fff', backgroundColor: '#222' },
   webRemote: { width: '100%', height: '100%', objectFit: 'cover' },
   webLocal: { width: '100%', height: '100%', objectFit: 'cover' },
   mobileRemote: { flex: 1 },
   mobileLocal: { flex: 1 },
-  hang: { backgroundColor: 'red', padding: 15, borderRadius: 30, position: 'absolute', bottom: 30, alignSelf: 'center', paddingHorizontal: 40 },
-  ringing: { position: 'absolute', top: '40%', width: '100%', alignItems: 'center', zIndex: 10 },
-  modal: { flex: 1, backgroundColor: 'rgba(0,0,0,0.8)', justifyContent: 'center', alignItems: 'center' },
-  card: { backgroundColor: '#fff', padding: 40, borderRadius: 20, alignItems: 'center' },
-  callFrom: { fontSize: 24, fontWeight: 'bold', marginBottom: 10 },
-  acc: { backgroundColor: 'green', padding: 15, borderRadius: 10, marginRight: 10 },
-  dec: { backgroundColor: 'red', padding: 15, borderRadius: 10 },
-  msg: { padding: 10, margin: 5, borderRadius: 10, maxWidth: '80%' },
-  my: { alignSelf: 'flex-end', backgroundColor: '#dcf8c6' },
-  ot: { alignSelf: 'flex-start', backgroundColor: '#eee' },
-  inRow: { flexDirection: 'row', padding: 15, borderTopWidth: 1, borderColor: '#eee' },
-  fld: { flex: 1, backgroundColor: '#f0f0f0', padding: 10, borderRadius: 20 },
-  sBtn: { backgroundColor: '#0088cc', padding: 10, borderRadius: 20, marginLeft: 10 },
-  audioPlaceholder: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  audioIcon: { fontSize: 60, marginBottom: 20 },
-  link: { marginTop: 20, color: '#0088cc' }
+  hang: { backgroundColor: '#e03030', padding: 16, borderRadius: 40, position: 'absolute', bottom: 40, alignSelf: 'center', paddingHorizontal: 50 },
+  ringing: { position: 'absolute', top: '38%', width: '100%', alignItems: 'center', zIndex: 10 },
+  audioPlaceholder: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#1a1a2e' },
+  audioIcon: { fontSize: 72, marginBottom: 20 },
+
+  // Incoming call modal
+  modal: { flex: 1, backgroundColor: 'rgba(0,0,0,0.75)', justifyContent: 'center', alignItems: 'center' },
+  card: { backgroundColor: '#fff', padding: 40, borderRadius: 20, alignItems: 'center', width: 300 },
+  callFrom: { fontSize: 24, fontWeight: 'bold', marginBottom: 8 },
+  acc: { backgroundColor: '#28a745', paddingVertical: 14, paddingHorizontal: 28, borderRadius: 12, marginRight: 12 },
+  dec: { backgroundColor: '#dc3545', paddingVertical: 14, paddingHorizontal: 28, borderRadius: 12 },
 });
 
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
 export default function App() {
   return (
-    <GestureHandlerRootView style={{flex:1}}><NavigationContainer><Stack.Navigator screenOptions={{headerShown:false}}><Stack.Screen name="Login" component={Login} /><Stack.Screen name="Chat" component={Chat} /></Stack.Navigator></NavigationContainer></GestureHandlerRootView>
+    <GestureHandlerRootView style={{ flex: 1 }}>
+      <NavigationContainer>
+        <Stack.Navigator screenOptions={{ headerShown: false }}>
+          <Stack.Screen name="Login" component={LoginScreen} />
+          <Stack.Screen name="ChatList" component={ChatListScreen} />
+          <Stack.Screen name="Chat" component={ChatScreen} />
+          <Stack.Screen name="VideoCall" component={VideoCallScreen} />
+        </Stack.Navigator>
+      </NavigationContainer>
+    </GestureHandlerRootView>
   );
 }

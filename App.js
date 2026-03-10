@@ -1,15 +1,36 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, Alert, Platform, Modal, SafeAreaView } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, FlatList, StyleSheet, Alert, Platform, Modal, Linking } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createStackNavigator } from '@react-navigation/stack';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { supabase } from './supabase';
+import {
+  sendTextMessage,
+  sendVoiceMessage,
+  sendFileMessage,
+  loadChatHistory,
+  subscribeToMessages,
+} from './chatService';
+import {
+  initiateCall,
+  answerCall,
+  cleanupCall,
+  sendHangup,
+  handleSignalingData,
+  subscribeToCallSignals,
+} from './callService';
+import {
+  formatTimestamp,
+  getFileIcon,
+  formatFileSize,
+  isOwnMessage,
+} from './messageService';
+import { detectFileType } from './fileService';
 
 // --- PLATFORM SAFE WEBRTC IMPORTS ---
 const WebRTC = Platform.OS !== 'web' ? require('react-native-webrtc') : null;
 
 const Stack = createStackNavigator();
-const iceConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
 
 // --- TELEGRAM-STYLE VIDEO COMPONENT ---
 const VideoPlayer = ({ stream, isLocal, audioOnly }) => {
@@ -58,90 +79,264 @@ function Chat({ route }) {
   const [sel, setSel] = useState(null);
   const [msgs, setMsgs] = useState([]);
   const [txt, setTxt] = useState('');
-  
-  const [callState, setCallState] = useState('idle'); // idle, ringing, connected
+
+  // Call state
+  const [callState, setCallState] = useState('idle'); // idle | ringing | connected
   const [incoming, setIncoming] = useState(null);
   const [isAudio, setIsAudio] = useState(false);
   const [localStream, setLocalStream] = useState(null);
   const [remoteStream, setRemoteStream] = useState(null);
   const pc = useRef(null);
 
+  // Voice recording state
+  const [isRecording, setIsRecording] = useState(false);
+  const mediaRecorderRef = useRef(null);
+  const audioChunksRef = useRef([]);
+  const recordingStreamRef = useRef(null);
+
+  // Keep a ref to the selected user inside async callbacks
+  const selRef = useRef(sel);
+  useEffect(() => { selRef.current = sel; }, [sel]);
+
+  // Load users list and subscribe to real-time events
   useEffect(() => {
-    supabase.from('users_table').select('username').then(({ data }) => setUsers(data.filter(x => x.username !== me)));
+    supabase.from('users_table').select('username').then(({ data }) => {
+      setUsers((data || []).filter(x => x.username !== me));
+    });
 
-    // Real-time: Global Listener for Calls and Messages
-    const channel = supabase.channel('global')
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, p => {
-        if (p.new.receiver_username === me && sel === p.new.sender_username) setMsgs(curr => [...curr, p.new]);
-      })
-      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'calls' }, p => {
-        if (p.new.receiver === me) handleSignaling(p.new);
-      }).subscribe();
-    return () => supabase.removeChannel(channel);
-  }, [sel]);
+    const msgChannel = subscribeToMessages(me, (newMsg) => {
+      if (newMsg.sender === selRef.current) {
+        setMsgs(curr => {
+          // Replace the last matching optimistic entry, or append if none exists
+          const idx = curr.findLastIndex(
+            m => m._optimistic && m.text === newMsg.text && m.sender === newMsg.sender
+          );
+          if (idx !== -1) {
+            const next = [...curr];
+            next[idx] = newMsg;
+            return next;
+          }
+          return [...curr, newMsg];
+        });
+      }
+    });
 
-  // Load History when switching users
+    const callChannel = subscribeToCallSignals(me, (signal) => {
+      handleIncomingSignal(signal);
+    });
+
+    return () => {
+      supabase.removeChannel(msgChannel);
+      supabase.removeChannel(callChannel);
+    };
+  }, []);
+
+  // Load chat history when conversation partner changes
   useEffect(() => {
     if (sel) {
-      supabase.from('messages').select('*')
-        .or(`and(sender_username.eq.${me},receiver_username.eq.${sel}),and(sender_username.eq.${sel},receiver_username.eq.${me})`)
-        .order('created_at', { ascending: true })
-        .then(({data}) => setMsgs(data || []));
+      loadChatHistory(me, sel).then(setMsgs).catch(() => setMsgs([]));
     }
   }, [sel]);
 
-  const handleSignaling = async (s) => {
+  const handleIncomingSignal = async (s) => {
     if (s.type === 'offer') { setIncoming(s); setIsAudio(s.is_audio); }
-    if (s.type === 'hangup') endCall();
+    if (s.type === 'hangup') doEndCall();
     if (s.type === 'answer' && pc.current) {
       setCallState('connected');
-      const desc = Platform.OS === 'web' ? s.data : new WebRTC.RTCSessionDescription(s.data);
-      await pc.current.setRemoteDescription(desc);
+      await handleSignalingData(pc.current, s);
     }
     if (s.type === 'candidate' && pc.current) {
-      const cand = Platform.OS === 'web' ? s.data : new WebRTC.RTCIceCandidate(s.data);
-      await pc.current.addIceCandidate(cand);
+      await handleSignalingData(pc.current, s);
     }
   };
 
-  const startCall = async (type, isCaller, signal = null) => {
+  const startOutgoingCall = async (type) => {
+    if (!sel) return;
     setIsAudio(type === 'audio');
-    setCallState(isCaller ? 'ringing' : 'connected');
-    setIncoming(null);
-
-    const stream = await (Platform.OS === 'web' ? navigator.mediaDevices.getUserMedia({video: type==='video', audio:true}) : WebRTC.mediaDevices.getUserMedia({video: type==='video', audio:true}));
-    setLocalStream(stream);
-
-    pc.current = Platform.OS === 'web' ? new RTCPeerConnection(iceConfig) : new WebRTC.RTCPeerConnection(iceConfig);
-    
-    if (Platform.OS === 'web') {
-      stream.getTracks().forEach(t => pc.current.addTrack(t, stream));
-      pc.current.ontrack = (e) => setRemoteStream(e.streams[0]);
-    } else {
-      pc.current.addStream(stream);
-      pc.current.onaddstream = (e) => setRemoteStream(e.stream);
-    }
-
-    pc.current.onicecandidate = (e) => {
-      if (e.candidate) supabase.from('calls').insert([{ caller: me, receiver: isCaller ? sel : signal.caller, type: 'candidate', data: e.candidate }]);
-    };
-
-    if (isCaller) {
-      const offer = await pc.current.createOffer();
-      await pc.current.setLocalDescription(offer);
-      await supabase.from('calls').insert([{ caller: me, receiver: sel, type: 'offer', data: offer, is_audio: type === 'audio' }]);
-    } else {
-      await pc.current.setRemoteDescription(Platform.OS === 'web' ? signal.data : new WebRTC.RTCSessionDescription(signal.data));
-      const answer = await pc.current.createAnswer();
-      await pc.current.setLocalDescription(answer);
-      await supabase.from('calls').insert([{ caller: me, receiver: signal.caller, type: 'answer', data: answer }]);
+    setCallState('ringing');
+    try {
+      const { pc: newPc, localStream: stream } = await initiateCall(
+        me, sel, type,
+        () => {},
+        (stream) => setRemoteStream(stream)
+      );
+      pc.current = newPc;
+      setLocalStream(stream);
+    } catch (e) {
+      Alert.alert('Call Error', e.message || 'Could not start call');
+      setCallState('idle');
     }
   };
 
-  const endCall = () => {
-    if (localStream) localStream.getTracks().forEach(t => t.stop());
-    setLocalStream(null); setRemoteStream(null); setCallState('idle');
-    if (pc.current) pc.current.close();
+  const acceptIncomingCall = async () => {
+    if (!incoming) return;
+    const callType = incoming.is_audio ? 'audio' : 'video';
+    setSel(incoming.caller);
+    setIsAudio(incoming.is_audio);
+    setCallState('connected');
+    setIncoming(null);
+    try {
+      const { pc: newPc, localStream: stream } = await answerCall(
+        me, incoming, callType,
+        () => {},
+        (s) => setRemoteStream(s)
+      );
+      pc.current = newPc;
+      setLocalStream(stream);
+    } catch (e) {
+      Alert.alert('Call Error', e.message || 'Could not answer call');
+      setCallState('idle');
+    }
+  };
+
+  const doEndCall = () => {
+    cleanupCall(pc.current, localStream);
+    pc.current = null;
+    setLocalStream(null);
+    setRemoteStream(null);
+    setCallState('idle');
+  };
+
+  const hangUp = async () => {
+    if (sel) await sendHangup(me, sel);
+    doEndCall();
+  };
+
+  // --- Voice recording ---
+  const startRecording = async () => {
+    if (!sel) return;
+    if (Platform.OS === 'web') {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        recordingStreamRef.current = stream;
+        audioChunksRef.current = [];
+        mediaRecorderRef.current = new MediaRecorder(stream);
+        mediaRecorderRef.current.ondataavailable = (e) => {
+          if (e.data.size > 0) audioChunksRef.current.push(e.data);
+        };
+        mediaRecorderRef.current.start();
+        setIsRecording(true);
+      } catch (e) {
+        Alert.alert('Microphone Error', 'Could not access microphone');
+      }
+    } else {
+      Alert.alert('Voice Messages', 'Hold the 🎤 button to record on mobile.');
+    }
+  };
+
+  const stopRecordingAndSend = async () => {
+    if (!isRecording || !sel) return;
+    setIsRecording(false);
+    if (Platform.OS === 'web' && mediaRecorderRef.current) {
+      mediaRecorderRef.current.onstop = async () => {
+        if (recordingStreamRef.current) {
+          recordingStreamRef.current.getTracks().forEach(t => t.stop());
+          recordingStreamRef.current = null;
+        }
+        const audioBlob = new Blob(audioChunksRef.current, { type: 'audio/ogg; codecs=opus' });
+        try {
+          await sendVoiceMessage(me, sel, audioBlob);
+        } catch (e) {
+          Alert.alert('Error', 'Failed to send voice message');
+        }
+      };
+      mediaRecorderRef.current.stop();
+    }
+  };
+
+  // --- File attachment ---
+  const handleFileAttachment = () => {
+    if (!sel) return;
+    if (Platform.OS === 'web') {
+      const input = document.createElement('input');
+      input.type = 'file';
+      input.accept = '*/*';
+      input.onchange = async (e) => {
+        const file = e.target.files[0];
+        if (!file) return;
+        const fileType = detectFileType(file);
+        try {
+          await sendFileMessage(me, sel, file, fileType);
+        } catch (err) {
+          Alert.alert('Error', 'Failed to send file');
+        }
+      };
+      input.click();
+    } else {
+      Alert.alert('File Sharing', 'File sharing is fully supported on web. Mobile file picker support coming soon.');
+    }
+  };
+
+  // --- Send text message ---
+  const handleSend = async () => {
+    if (!txt.trim() || !sel) return;
+    const text = txt.trim();
+    setTxt('');
+    try {
+      await sendTextMessage(me, sel, text);
+      // Optimistically show the sent message; dedupe by id if the realtime
+      // subscription delivers it later.
+      setMsgs(curr => {
+        const optimistic = {
+          sender: me, receiver: sel, text, type: 'text',
+          timestamp: new Date().toISOString(),
+          _optimistic: true,
+        };
+        return [...curr, optimistic];
+      });
+    } catch (e) {
+      Alert.alert('Error', 'Failed to send message');
+    }
+  };
+
+  // --- Message renderer ---
+  const renderMessage = ({ item }) => {
+    const mine = isOwnMessage(item, me);
+    const msgStyle = [styles.msg, mine ? styles.my : styles.ot];
+    const ts = formatTimestamp(item.timestamp || item.created_at);
+
+    if (item.type === 'voice') {
+      return (
+        <View style={msgStyle}>
+          <Text>🎤 Voice message</Text>
+          {item.voice_url && Platform.OS === 'web' && (
+            <audio controls src={item.voice_url} style={{ marginTop: 4, maxWidth: 200 }} />
+          )}
+          {ts ? <Text style={styles.msgTime}>{ts}</Text> : null}
+        </View>
+      );
+    }
+
+    if (item.type === 'file') {
+      const icon = getFileIcon(item.file_type);
+      const sizeLabel = formatFileSize(item.file_size);
+      return (
+        <TouchableOpacity
+          style={msgStyle}
+          onPress={() => {
+            if (item.file_url) {
+              if (Platform.OS === 'web') {
+                window.open(item.file_url, '_blank');
+              } else {
+                Linking.openURL(item.file_url);
+              }
+            }
+          }}
+        >
+          <Text>{icon} {item.file_name || 'File'}</Text>
+          {sizeLabel ? <Text style={styles.msgMeta}>{sizeLabel}</Text> : null}
+          {ts ? <Text style={styles.msgTime}>{ts}</Text> : null}
+        </TouchableOpacity>
+      );
+    }
+
+    // Default: text message (supports both old 'content' and new 'text' fields)
+    return (
+      <View style={msgStyle}>
+        <Text>{item.text || item.content}</Text>
+        {ts ? <Text style={styles.msgTime}>{ts}</Text> : null}
+      </View>
+    );
   };
 
   return (
@@ -151,10 +346,22 @@ function Chat({ route }) {
         <View style={styles.modal}>
           <View style={styles.card}>
             <Text style={styles.callFrom}>{incoming?.caller}</Text>
-            <Text style={{marginBottom: 20}}>{incoming?.is_audio ? 'Audio Call...' : 'Video Call...'}</Text>
-            <View style={{flexDirection: 'row'}}>
-              <TouchableOpacity onPress={() => {setSel(incoming.caller); startCall(incoming.is_audio ? 'audio' : 'video', false, incoming);}} style={styles.acc}><Text style={{color:'#fff'}}>Accept</Text></TouchableOpacity>
-              <TouchableOpacity onPress={() => {supabase.from('calls').insert([{caller:me, receiver:incoming.caller, type:'hangup'}]); setIncoming(null);}} style={styles.dec}><Text style={{color:'#fff'}}>Decline</Text></TouchableOpacity>
+            <Text style={{ marginBottom: 20 }}>
+              {incoming?.is_audio ? '📞 Audio Call...' : '📹 Video Call...'}
+            </Text>
+            <View style={{ flexDirection: 'row' }}>
+              <TouchableOpacity onPress={acceptIncomingCall} style={styles.acc}>
+                <Text style={{ color: '#fff' }}>Accept</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                onPress={() => {
+                  sendHangup(me, incoming.caller);
+                  setIncoming(null);
+                }}
+                style={styles.dec}
+              >
+                <Text style={{ color: '#fff' }}>Decline</Text>
+              </TouchableOpacity>
             </View>
           </View>
         </View>
@@ -163,43 +370,97 @@ function Chat({ route }) {
       {/* 2. SIDEBAR (30%) */}
       <View style={styles.side}>
         <Text style={styles.logoSide}>King Chat</Text>
-        <FlatList data={users} renderItem={({item}) => (
-          <TouchableOpacity style={[styles.tab, sel === item.username && styles.act]} onPress={() => setSel(item.username)}>
-            <Text style={sel === item.username && {color:'#fff'}}>{item.username}</Text>
-          </TouchableOpacity>
-        )} />
+        <FlatList
+          data={users}
+          keyExtractor={(item) => item.username}
+          renderItem={({ item }) => (
+            <TouchableOpacity
+              style={[styles.tab, sel === item.username && styles.act]}
+              onPress={() => setSel(item.username)}
+            >
+              <Text style={sel === item.username ? { color: '#fff' } : null}>
+                {item.username}
+              </Text>
+            </TouchableOpacity>
+          )}
+        />
       </View>
 
       {/* 3. CHAT AREA (70%) */}
       <View style={styles.main}>
         {sel ? (
-          <View style={{flex:1}}>
+          <View style={{ flex: 1 }}>
+            {/* Header */}
             <View style={styles.head}>
-              <Text style={{fontWeight:'bold'}}>{sel}</Text>
-              <View style={{flexDirection:'row'}}>
-                <TouchableOpacity onPress={() => startCall('audio', true)} style={styles.audioBtn}><Text style={{color:'#fff'}}>Audio</Text></TouchableOpacity>
-                <TouchableOpacity onPress={() => startCall('video', true)} style={styles.videoBtn}><Text style={{color:'#fff'}}>Video</Text></TouchableOpacity>
+              <Text style={{ fontWeight: 'bold' }}>{sel}</Text>
+              <View style={{ flexDirection: 'row' }}>
+                <TouchableOpacity onPress={() => startOutgoingCall('audio')} style={styles.audioBtn}>
+                  <Text style={{ color: '#fff' }}>📞 Audio</Text>
+                </TouchableOpacity>
+                <TouchableOpacity onPress={() => startOutgoingCall('video')} style={styles.videoBtn}>
+                  <Text style={{ color: '#fff' }}>📹 Video</Text>
+                </TouchableOpacity>
               </View>
             </View>
 
             {callState !== 'idle' ? (
+              /* --- CALL STAGE --- */
               <View style={styles.vStage}>
-                {callState === 'ringing' && <View style={styles.ringing}><Text style={{color:'#fff', fontSize: 20}}>Calling {sel}...</Text></View>}
+                {callState === 'ringing' && (
+                  <View style={styles.ringing}>
+                    <Text style={{ color: '#fff', fontSize: 20 }}>Calling {sel}...</Text>
+                  </View>
+                )}
                 <VideoPlayer stream={remoteStream} isLocal={false} audioOnly={isAudio} />
-                {!isAudio && <View style={styles.pip}><VideoPlayer stream={localStream} isLocal={true} audioOnly={false} /></View>}
-                <TouchableOpacity onPress={() => {supabase.from('calls').insert([{caller:me, receiver:sel, type:'hangup'}]); endCall();}} style={styles.hang}><Text style={{color:'#fff', fontWeight:'bold'}}>Hang up</Text></TouchableOpacity>
+                {!isAudio && (
+                  <View style={styles.pip}>
+                    <VideoPlayer stream={localStream} isLocal={true} audioOnly={false} />
+                  </View>
+                )}
+                <TouchableOpacity onPress={hangUp} style={styles.hang}>
+                  <Text style={{ color: '#fff', fontWeight: 'bold' }}>Hang up</Text>
+                </TouchableOpacity>
               </View>
             ) : (
-              <View style={{flex:1}}>
-                <FlatList data={msgs} renderItem={({item}) => <View style={[styles.msg, item.sender_username === me ? styles.my : styles.ot]}><Text>{item.content}</Text></View>} />
+              /* --- CHAT MESSAGES --- */
+              <View style={{ flex: 1 }}>
+                <FlatList
+                  data={msgs}
+                  keyExtractor={(item, i) => item.id ? String(item.id) : `${item.sender}_${item.timestamp || i}`}
+                  renderItem={renderMessage}
+                />
+                {/* Input bar */}
                 <View style={styles.inRow}>
-                  <TextInput value={txt} onChangeText={setTxt} style={styles.fld} placeholder="Message..." />
-                  <TouchableOpacity onPress={async() => {await supabase.from('messages').insert([{sender_username:me, receiver_username:sel, content:txt}]); setTxt(''); }} style={styles.sBtn}><Text style={{color:'#fff'}}>Send</Text></TouchableOpacity>
+                  {/* File attachment */}
+                  <TouchableOpacity onPress={handleFileAttachment} style={styles.iconBtn}>
+                    <Text style={{ fontSize: 20 }}>📎</Text>
+                  </TouchableOpacity>
+                  {/* Voice recording */}
+                  <TouchableOpacity
+                    onPressIn={startRecording}
+                    onPressOut={stopRecordingAndSend}
+                    style={[styles.iconBtn, isRecording && styles.recording]}
+                  >
+                    <Text style={{ fontSize: 20 }}>🎤</Text>
+                  </TouchableOpacity>
+                  <TextInput
+                    value={txt}
+                    onChangeText={setTxt}
+                    style={styles.fld}
+                    placeholder="Message..."
+                    onSubmitEditing={handleSend}
+                    returnKeyType="send"
+                  />
+                  <TouchableOpacity onPress={handleSend} style={styles.sBtn}>
+                    <Text style={{ color: '#fff' }}>Send</Text>
+                  </TouchableOpacity>
                 </View>
               </View>
             )}
           </View>
-        ) : <View style={styles.center}><Text>Select a contact to chat</Text></View>}
+        ) : (
+          <View style={styles.center}><Text>Select a contact to chat</Text></View>
+        )}
       </View>
     </View>
   );
@@ -237,12 +498,16 @@ const styles = StyleSheet.create({
   msg: { padding: 10, margin: 5, borderRadius: 10, maxWidth: '80%' },
   my: { alignSelf: 'flex-end', backgroundColor: '#dcf8c6' },
   ot: { alignSelf: 'flex-start', backgroundColor: '#eee' },
-  inRow: { flexDirection: 'row', padding: 15, borderTopWidth: 1, borderColor: '#eee' },
+  msgTime: { fontSize: 10, color: '#999', marginTop: 4, alignSelf: 'flex-end' },
+  msgMeta: { fontSize: 11, color: '#777', marginTop: 2 },
+  inRow: { flexDirection: 'row', padding: 10, borderTopWidth: 1, borderColor: '#eee', alignItems: 'center' },
+  iconBtn: { padding: 8, borderRadius: 20, marginRight: 4 },
+  recording: { backgroundColor: '#ff4444' },
   fld: { flex: 1, backgroundColor: '#f0f0f0', padding: 10, borderRadius: 20 },
   sBtn: { backgroundColor: '#0088cc', padding: 10, borderRadius: 20, marginLeft: 10 },
   audioPlaceholder: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   audioIcon: { fontSize: 60, marginBottom: 20 },
-  link: { marginTop: 20, color: '#0088cc' }
+  link: { marginTop: 20, color: '#0088cc' },
 });
 
 export default function App() {
